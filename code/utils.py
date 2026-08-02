@@ -142,7 +142,7 @@ def format_context_for_prompt(context: dict) -> str:
         for m in context["message_history"][:5]:  # Top 5 only to keep prompt short
             history_lines.append(
                 f"  - [{m.get('message_id')}] {m.get('conversation_type')} | "
-                f"{m.get('message_text', '')[:80]} | forwarded: {m.get('forwarded_count', 0)}"
+                f"{str(m.get('message_text', '') or '')[:80]} | forwarded: {m.get('forwarded_count', 0)}"
             )
         sections.append("[MESSAGE HISTORY (recent)]\n" + "\n".join(history_lines))
 

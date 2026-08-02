@@ -1,0 +1,7 @@
+langgraph
+langchain-core
+langchain-groq
+openai-whisper
+pandas
+python-dotenv
+groq

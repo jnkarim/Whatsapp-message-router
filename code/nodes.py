@@ -1,8 +1,6 @@
 import base64
-import json
-import re
 from pathlib import Path
-from typing import Any
+import os
 
 import whisper
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,120 +9,76 @@ from retriever import retrieve_context
 from state import RouterState
 from llm import llm
 from prompts import SYSTEM_PROMPT
-from utils import parse_llm_json, format_context_for_prompt, extract_evidence_ids
+from utils import parse_llm_json, format_context_for_prompt
 
-# Load Whisper once at startup (not per message)
-# tiny model = fast, good enough for short voice notes
+# Load Whisper once at startup
 whisper_model = whisper.load_model("tiny")
 
 
-
-
-def retrieve_node(state: RouterState) -> RouterState:
-    """
-    First node in the pipeline.
-    Pulls all CSV context for this message using retrieve_context().
-    Stores it in state so all later nodes can use it.
-    """
+def retrieve_node(state: RouterState) -> dict:
     message = state["message"]
     context = retrieve_context(message)
-    return {**state, "context": context}
+    return {
+        "user":     context.get("user", {}),
+        "group":    context.get("group", {}),
+        "business": context.get("business", {}),
+        "history":  {
+            "group_member":          context.get("group_member", {}),
+            "user_business_history": context.get("user_business_history", {}),
+            "message_history":       context.get("message_history", []),
+            "message_events":        context.get("message_events", []),
+            "media_path":            context.get("media_path"),
+        }
+    }
 
 
+def image_node(state: RouterState) -> dict:
+    media_path = state["history"].get("media_path")
+    if not media_path or not Path(media_path).exists():
+        return {"image_context": "Image file not found."}
 
-def image_node(state: RouterState) -> RouterState:
-    """
-    Runs only if message has an image (checked by router in graph.py).
-    Reads the image file, converts to base64, sends to Groq vision model.
-    Adds the image description to context as 'media_content'.
-    """
-    context = state["context"]
-    media_path = context.get("media_path")
+    filename = Path(media_path).name
+    return {"image_context": f"Image attached: {filename}. Use message text and context for routing."}
+
+
+def voice_node(state: RouterState) -> dict:
+    from groq import Groq
+
+    media_path = state["history"].get("media_path")
 
     if not media_path or not Path(media_path).exists():
-        return {**state, "context": {**context, "media_content": "Image file not found."}}
-
-    # Read and encode image
-    with open(media_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-    # Determine media type
-    suffix = Path(media_path).suffix.lower()
-    media_type_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
-    mime_type = media_type_map.get(suffix, "image/jpeg")
-
-    # Ask LLM to describe the image for routing purposes
-    try:
-        response = llm.invoke([
-            HumanMessage(content=[
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{image_data}"
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "Describe this image in 2-3 sentences focusing on: "
-                        "what it is (poster, screenshot, photo), what it says or shows, "
-                        "and any red flags like fake urgency, OTP requests, suspicious links, "
-                        "or promotional content."
-                    )
-                }
-            ])
-        ])
-        description = response.content
-    except Exception as e:
-        description = f"Image analysis failed: {str(e)}"
-
-    return {**state, "context": {**context, "media_content": description}}
-
-
-
-def voice_node(state: RouterState) -> RouterState:
-    """
-    Runs only if message has a voice note (checked by router in graph.py).
-    Uses Whisper to transcribe the audio file.
-    Adds transcript to context as 'media_content'.
-    """
-    context = state["context"]
-    media_path = context.get("media_path")
-
-    if not media_path or not Path(media_path).exists():
-        return {**state, "context": {**context, "media_content": "Voice note file not found."}}
+        return {"voice_context": "Voice note file not found."}
 
     try:
-        result = whisper_model.transcribe(media_path)
-        transcript = result.get("text", "").strip()
-        media_content = f"Voice note transcript: {transcript}"
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        with open(media_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=f,
+                response_format="text"
+            )
+        return {"voice_context": f"Voice note transcript: {transcription}"}
     except Exception as e:
-        media_content = f"Transcription failed: {str(e)}"
-
-    return {**state, "context": {**context, "media_content": media_content}}
+        return {"voice_context": f"Transcription failed: {str(e)[:80]}"}
 
 
-
-
-def route_node(state: RouterState) -> RouterState:
-    """
-    The main decision node.
-    Takes the message + all context → sends to Groq LLM → gets routing decision.
-
-    LLM is asked to return a JSON with:
-    - action: notify / digest / mute
-    - message_type: personal / urgent / scam / etc.
-    - reason: short explanation
-    - confidence: 0 to 1
-    - evidence_message_ids: semicolon-separated IDs or 'none'
-    """
+def route_node(state: RouterState) -> dict:
     message = state["message"]
-    context = state["context"]
+    history = state.get("history", {})
 
-    # Format context into readable text for the prompt
+    context = {
+        "user":                  state.get("user", {}),
+        "group":                 state.get("group", {}),
+        "group_member":          history.get("group_member", {}),
+        "business":              state.get("business", {}),
+        "user_business_history": history.get("user_business_history", {}),
+        "message_history":       history.get("message_history", []),
+        "message_events":        history.get("message_events", []),
+        "media_content":         state.get("image_context") or state.get("voice_context"),
+    }
+
     context_text = format_context_for_prompt(context)
 
-    # Build the full user prompt
     user_prompt = f"""
 Incoming message details:
 - message_id: {message.get('message_id')}
@@ -164,26 +118,29 @@ Respond ONLY with a valid JSON object in this exact format:
             "evidence_message_ids": "none"
         }
 
-    return {**state, "prediction": prediction}
+    return {"prediction": prediction}
 
 
+def output_node(state: RouterState) -> dict:
+    message    = state["message"]
+    prediction = state.get("prediction")
 
-
-def output_node(state: RouterState) -> RouterState:
-    """
-    Final node. Takes the prediction dict and formats it
-    into the exact output row structure needed for output.csv.
-    """
-    message = state["message"]
-    prediction = state.get("prediction", {})
+    if not isinstance(prediction, dict):
+        prediction = {
+            "action": "digest",
+            "message_type": "unknown",
+            "reason": "Invalid prediction format",
+            "confidence": 0.3,
+            "evidence_message_ids": "none"
+        }
 
     result = {
-        "message_id":          message.get("message_id"),
-        "action":              prediction.get("action", "digest"),
-        "message_type":        prediction.get("message_type", "unknown"),
-        "reason":              prediction.get("reason", "No reason provided"),
-        "confidence":          prediction.get("confidence", 0.3),
+        "message_id":           message.get("message_id"),
+        "action":               prediction.get("action", "digest"),
+        "message_type":         prediction.get("message_type", "unknown"),
+        "reason":               prediction.get("reason", "No reason provided"),
+        "confidence":           prediction.get("confidence", 0.3),
         "evidence_message_ids": prediction.get("evidence_message_ids", "none")
     }
 
-    return {**state, "result": result}
+    return {"history": {**state.get("history", {}), "result": result}}

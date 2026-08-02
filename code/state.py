@@ -49,7 +49,7 @@ class RouterState(TypedDict):
     business: Optional[dict]
     
     # prev related msg
-    history: list
+    history: dict
     
     # image analysis res
     image_context: Optional[str]
